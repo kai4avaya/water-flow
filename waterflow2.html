@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sketch River Flow</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #f2e6d6; /* Tan Background */
+            font-family: 'Courier New', Courier, monospace;
+        }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <!-- Import Map for Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- Configuration ---
+        const CONFIG = {
+            colors: {
+                background: 0xf2e6d6, // Tan
+                inkMain: 0x2c3e50,
+                inkLight: 0x93a1a1,
+                inkAccent: 0x268bd2,
+                rockColor: 0x8899a6,
+                rockOutline: 0x2c3e50,
+                shrubColor: 0x268bd2, 
+                waterBase: 0xfcf5ed   // Bright Tan White for water
+            },
+            speed: 0.002, 
+            riverWidth: 4,
+            interactionRadius: 3.0
+        };
+
+        // --- Global Variables ---
+        let scene, camera, renderer;
+        let birds = []; 
+        let ripples = []; 
+        let time = 0;
+        let mainCurvePath; 
+        
+        // Interaction globals
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2(-100, -100); 
+        const interactionPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        let mouseProjected = new THREE.Vector3(0, 0, 0);
+        let lastRippleTime = 0;
+
+        // --- Initialization ---
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(CONFIG.colors.background);
+            scene.fog = new THREE.FogExp2(CONFIG.colors.background, 0.02);
+
+            camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 3.5, 9); 
+            camera.lookAt(0, 0, -12);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 1.0);
+            scene.add(ambientLight);
+
+            createRiverSystem(); 
+            createLandscape();
+            createOneRock();     
+            createVerticalShrubs(); 
+            createBirds();
+            createPaperTextureOverlay(); 
+
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('mousemove', onMouseMove);
+            
+            animate();
+        }
+
+        function onMouseMove(event) {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        // --- River System ---
+        function createRiverSystem() {
+            const mainPoints = [
+                new THREE.Vector3(0, 0, 10),
+                new THREE.Vector3(0.5, 0, 5),
+                new THREE.Vector3(-1.5, 0, -2),
+                new THREE.Vector3(2.0, 0, -15),
+                new THREE.Vector3(-1.0, 0, -30),
+                new THREE.Vector3(0, 0, -60)
+            ];
+            mainCurvePath = new THREE.CatmullRomCurve3(mainPoints);
+
+            // 2. Create Water Surface Mesh (Custom Strip Geometry)
+            // Using a custom BufferGeometry ensures the mesh topology perfectly follows the curve
+            const divisions = 200;
+            const points = mainCurvePath.getPoints(divisions);
+            const geometry = new THREE.BufferGeometry();
+            
+            const vertices = [];
+            const indices = [];
+
+            for(let i=0; i <= divisions; i++) {
+                const t = i / divisions;
+                const point = points[i];
+                const tangent = mainCurvePath.getTangent(t);
+                const normal = new THREE.Vector3(-tangent.z, 0, tangent.x).normalize(); 
+                
+                const widthAtDepth = CONFIG.riverWidth + (Math.abs(point.z) * 0.1);
+                // Keep strictly inside banks (Bank width factor is ~0.52 per side)
+                const waterWidth = widthAtDepth * 0.85; 
+                
+                // Left vertex
+                vertices.push(
+                    point.x + normal.x * waterWidth * 0.5, 
+                    0, 
+                    point.z + normal.z * waterWidth * 0.5
+                );
+                // Right vertex
+                vertices.push(
+                    point.x - normal.x * waterWidth * 0.5, 
+                    0, 
+                    point.z - normal.z * waterWidth * 0.5
+                );
+
+                // Create faces (2 triangles per segment)
+                if (i < divisions) {
+                    const base = i * 2;
+                    // Triangle 1: Base, Base+1, Base+2
+                    indices.push(base, base + 1, base + 2);
+                    // Triangle 2: Base+1, Base+3, Base+2
+                    indices.push(base + 1, base + 3, base + 2);
+                }
+            }
+            
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            geometry.setIndex(indices);
+            geometry.computeVertexNormals();
+
+            const waterMat = new THREE.MeshBasicMaterial({ 
+                color: CONFIG.colors.waterBase, 
+                side: THREE.DoubleSide,
+                transparent: true,
+                opacity: 0.95 
+            });
+            const waterMesh = new THREE.Mesh(geometry, waterMat);
+            waterMesh.position.y = -0.05; 
+            scene.add(waterMesh);
+
+            // 3. Banks (Outlines)
+            const createSketchyBank = (side) => { 
+                const numPasses = 3;
+                for(let k=0; k<numPasses; k++) {
+                    const bankPoints = mainPoints.map(p => {
+                        const widthAtDepth = CONFIG.riverWidth + (Math.abs(p.z) * 0.1);
+                        return new THREE.Vector3(
+                            p.x + (side * widthAtDepth * 0.52) + (Math.random()-0.5)*0.5, 
+                            0.05 + Math.random() * 0.05, 
+                            p.z
+                        );
+                    });
+                    const curve = new THREE.CatmullRomCurve3(bankPoints);
+                    const bPoints = curve.getPoints(100);
+                    const bGeo = new THREE.BufferGeometry().setFromPoints(bPoints);
+                    const bMat = new THREE.LineBasicMaterial({ 
+                        color: CONFIG.colors.inkMain, 
+                        opacity: 0.5, 
+                        transparent: true 
+                    });
+                    scene.add(new THREE.Line(bGeo, bMat));
+                }
+            };
+            createSketchyBank(1);
+            createSketchyBank(-1);
+        }
+
+        // --- Single Rock in Water ---
+        function createOneRock() {
+            const t = 0.2; 
+            const pointOnPath = mainCurvePath.getPoint(t);
+            const pos = new THREE.Vector3(pointOnPath.x + 0.5, 0.02, pointOnPath.z);
+
+            const shape = new THREE.Shape();
+            const numPoints = 7;
+            const radius = 0.4;
+            const points = [];
+
+            for (let j = 0; j < numPoints; j++) {
+                const angle = (j / numPoints) * Math.PI * 2;
+                const r = radius * (0.7 + Math.random() * 0.6);
+                points.push({ x: Math.cos(angle) * r, y: Math.sin(angle) * r });
+            }
+            
+            shape.moveTo(points[0].x, points[0].y);
+            for(let j=1; j<points.length; j++) shape.lineTo(points[j].x, points[j].y);
+            shape.lineTo(points[0].x, points[0].y);
+
+            const geometry = new THREE.ShapeGeometry(shape);
+            const material = new THREE.MeshBasicMaterial({ color: CONFIG.colors.rockColor, side: THREE.DoubleSide });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.rotation.x = -Math.PI / 2; 
+            mesh.position.copy(pos);
+
+            const edges = new THREE.EdgesGeometry(geometry);
+            const lineMat = new THREE.LineBasicMaterial({ color: CONFIG.colors.rockOutline, linewidth: 1 });
+            const outline = new THREE.LineSegments(edges, lineMat);
+            mesh.add(outline);
+
+            scene.add(mesh);
+        }
+
+        // --- Ripple System ---
+        function createRipple(position) {
+            const curve = new THREE.EllipseCurve(0, 0, 0.1, 0.1, 0, 2 * Math.PI, false, 0);
+            const points = curve.getPoints(50);
+            const geometry = new THREE.BufferGeometry().setFromPoints(points);
+            geometry.rotateX(-Math.PI / 2);
+
+            const material = new THREE.LineBasicMaterial({ 
+                color: CONFIG.colors.inkAccent, 
+                transparent: true, 
+                opacity: 0.8 
+            });
+            
+            const rippleMesh = new THREE.Line(geometry, material);
+            rippleMesh.position.copy(position);
+            rippleMesh.position.y = 0.02;
+            
+            scene.add(rippleMesh);
+
+            ripples.push({
+                mesh: rippleMesh,
+                age: 0,
+                maxAge: 80,
+                growthSpeed: 0.03
+            });
+        }
+
+        // --- Blue Shrubs ---
+        function createVerticalShrubs() {
+            const numShrubClusters = 15;
+            for(let i=0; i<numShrubClusters; i++) {
+                const side = Math.random() > 0.5 ? 1 : -1;
+                const t = Math.random() * 0.9; 
+                const pointOnPath = mainCurvePath.getPoint(t);
+                const widthAtDepth = CONFIG.riverWidth + (Math.abs(pointOnPath.z) * 0.1);
+                const bankX = pointOnPath.x + (side * widthAtDepth * 0.75); 
+                
+                const center = new THREE.Vector3(bankX + (Math.random() * 2 * side), 0, pointOnPath.z);
+
+                const positions = [];
+                const count = 12;
+                const radius = 0.5;
+
+                for(let j=0; j<count; j++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const r = Math.random() * radius;
+                    const lx = center.x + Math.cos(angle) * r;
+                    const lz = center.z + Math.sin(angle) * r;
+                    const h = 0.3 + Math.random() * 0.4; 
+                    
+                    positions.push(lx, 0, lz);
+                    positions.push(lx + (Math.random()-0.5)*0.15, h, lz);
+                }
+
+                const geo = new THREE.BufferGeometry();
+                geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                const mat = new THREE.LineBasicMaterial({ color: CONFIG.colors.shrubColor, opacity: 0.6, transparent: true });
+                scene.add(new THREE.LineSegments(geo, mat));
+            }
+        }
+
+        function createBirds() {
+            const numBirds = 5;
+            for(let i=0; i<numBirds; i++) {
+                const geometry = new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(-0.2, 0, 0),
+                    new THREE.Vector3(0, -0.1, 0),
+                    new THREE.Vector3(0.2, 0, 0)
+                ]);
+                const material = new THREE.LineBasicMaterial({ color: CONFIG.colors.inkMain });
+                const bird = new THREE.Line(geometry, material);
+                
+                bird.position.set(2 + Math.random()*4, 4 + Math.random()*2, -10 - Math.random()*10);
+                bird.userData = { speed: 0.02 + Math.random()*0.01, yOffset: Math.random()*100 };
+                scene.add(bird);
+                birds.push(bird);
+            }
+        }
+
+        function createLandscape() {
+            const groundLines = 25;
+            for (let i = 0; i < groundLines; i++) {
+                const z = 5 - (i * (60 / groundLines)); 
+                const lPoints = [];
+                for(let x = -20; x < -2; x+=0.5) lPoints.push(new THREE.Vector3(x, Math.sin(x*0.5+z*0.2)*0.5, z));
+                if(lPoints.length>1) scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(lPoints), new THREE.LineBasicMaterial({ color: CONFIG.colors.inkLight, transparent: true, opacity: 0.3 })));
+                
+                const rPoints = [];
+                for(let x = 2; x < 20; x+=0.5) rPoints.push(new THREE.Vector3(x, Math.sin(x*0.5+z*0.2)*0.5, z));
+                if(rPoints.length>1) scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(rPoints), new THREE.LineBasicMaterial({ color: CONFIG.colors.inkLight, transparent: true, opacity: 0.3 })));
+            }
+        }
+
+        function createPaperTextureOverlay() {
+            const geometry = new THREE.BufferGeometry();
+            const vertices = [];
+            for ( let i = 0; i < 2000; i ++ ) {
+                const x = (Math.random() - 0.5) * 40;
+                const y = (Math.random() - 0.5) * 20;
+                const z = (Math.random() - 0.5) * 20; 
+                if (z > 5) continue;
+                vertices.push( x, y, z );
+            }
+            geometry.setAttribute( 'position', new THREE.Float32BufferAttribute( vertices, 3 ) );
+            const particles = new THREE.Points( geometry, new THREE.PointsMaterial({ color: 0x8b7e66, size: 0.02, opacity: 0.3, transparent: true }));
+            scene.add( particles );
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 0.01;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = new THREE.Vector3();
+            raycaster.ray.intersectPlane(interactionPlane, intersects);
+            if(intersects) {
+                mouseProjected.copy(intersects);
+                if (time - lastRippleTime > 0.1) { 
+                    if (Math.abs(mouseProjected.x) < 4 && mouseProjected.z < 10 && mouseProjected.z > -40) {
+                         createRipple(mouseProjected);
+                         lastRippleTime = time;
+                    }
+                }
+            }
+
+            for (let i = ripples.length - 1; i >= 0; i--) {
+                const r = ripples[i];
+                r.age++;
+                const scale = 1 + (r.age * r.growthSpeed);
+                r.mesh.scale.set(scale, 1, scale);
+                r.mesh.material.opacity = 0.8 * (1 - (r.age / r.maxAge));
+
+                if (r.age > r.maxAge) {
+                    scene.remove(r.mesh);
+                    r.mesh.geometry.dispose();
+                    r.mesh.material.dispose();
+                    ripples.splice(i, 1);
+                }
+            }
+
+            birds.forEach(bird => {
+                bird.position.z -= bird.userData.speed;
+                bird.scale.y = Math.sin(time * 10 + bird.userData.yOffset);
+                if(bird.position.z < -40) bird.position.z = 5;
+            });
+
+            camera.position.y = 3.5 + Math.sin(time * 0.5) * 0.05;
+            camera.lookAt(0, 0, -12);
+
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
